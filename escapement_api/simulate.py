@@ -48,6 +48,7 @@ class Sample:
     t: float
     point: Optional[np.ndarray]
     penetration: float = 0.0
+    pen_tooth: Optional[int] = None
 
 
 @dataclass
@@ -75,11 +76,15 @@ class Run:
 
 def psi_for(Q: np.ndarray, k: int, wheel: WheelGeom,
             O: np.ndarray, ref: float) -> float:
-    """齿 k 齿尖位于世界点 Q 时的轮转角（展开到 ref 附近）。"""
+    """齿 k 齿尖位于世界点 Q 时的轮转角（展开到 ref 附近）。
+
+    展开周期取 ``wheel.unwrap``：名义轮为齿距（各齿等价），逐齿误差
+    轮为整圈 2π（齿号与绝对角位置绑定）。
+    """
     alpha = math.atan2(Q[1] - O[1], Q[0] - O[0])
-    psi = wheel.s * (alpha - k * wheel.pitch)
-    n = round((ref - psi) / wheel.pitch)
-    return psi + n * wheel.pitch
+    psi = wheel.s * (alpha - wheel.phi(k))
+    n = round((ref - psi) / wheel.unwrap)
+    return psi + n * wheel.unwrap
 
 
 class Simulation:
@@ -101,36 +106,66 @@ class Simulation:
         self.psi_start = sw.initial_wheel_phase * D2R
         self.step = inp.step_deg * D2R
         self.anomalies: List[dict] = []
+        # 单个锚周期内首尾按循环处理（全轮分析子类关闭）
+        self.cyclic = True
+        # 落瓦搜索窗口（弧度）；逐齿误差轮需要略大于一个齿距
+        self.landing_window = self.wheel.pitch * 0.999
+        # 失锁后重新搜索接触的窗口
+        self.relock_window = self.wheel.pitch
+        # 穿透检查在每个齿号中心两侧覆盖的齿数
+        self.pen_span = 2
+        # 穿透检查间隔（样本数）；1=每样本。穿透是缓变量，全轮分析
+        # 可隔点检查以省时（不影响接触追踪，只影响诊断粒度）
+        self.pen_check_every = 1
+        self._pen_key = None      # 上次穿透检查的接触 (pallet, face, k)
+        self._pen_cache = (0.0, None, None)
 
     # ------------------------------------------------------------------
     # 接触查询
     # ------------------------------------------------------------------
+    def _tooth_hits(self, fg, theta: float, k: int):
+        """齿 k 的齿尖圆（半径 Rp_of(k)）与瓦面求交。
+
+        名义轮所有齿同半径，调用方可用统一节圆结果复用以省时。
+        """
+        return arc_intersection_t(fg, theta, self.A, self.O,
+                                  self.wheel.Rp_of(k))
+
     def _face_hits(self, theta: float, ref_psi: float,
                    window: float, ahead: bool):
         """枚举所有瓦面交点对应的候选齿接触。
 
         返回 [{pallet, face, t, Q, k, psi}]，按 ψ 排序。
+        逐齿误差轮中每个候选齿用其实际齿尖半径求交（名义轮退化为
+        统一节圆，结果与单一求交一致）。
         """
         cands = []
+        Rp0 = self.wheel.Rp
         for pg in self.pallets:
             for fg in pg.faces():
-                for t, Q in arc_intersection_t(
-                        fg, theta, self.A, self.O, self.wheel.Rp):
-                    alpha = math.atan2(Q[1] - self.O[1], Q[0] - self.O[0])
+                for t0, Q0 in arc_intersection_t(
+                        fg, theta, self.A, self.O, Rp0):
+                    alpha = math.atan2(Q0[1] - self.O[1], Q0[0] - self.O[0])
                     k0 = int(round((alpha - self.wheel.s * ref_psi)
                                    / self.wheel.pitch))
                     for kk in (k0 - 1, k0, k0 + 1):
-                        psi = psi_for(Q, kk, self.wheel, self.O, ref_psi)
-                        if ahead:
-                            if not (ref_psi + EPS_ANG < psi
-                                    <= ref_psi + window):
-                                continue
+                        if abs(self.wheel.Rp_of(kk) - Rp0) <= 1e-9:
+                            hits = ((t0, Q0),)
                         else:
-                            if not (ref_psi - window <= psi
-                                    <= ref_psi + window):
-                                continue
-                        cands.append(dict(pallet=pg.idx, face=fg.kind,
-                                          t=t, Q=Q, k=kk, psi=psi))
+                            hits = self._tooth_hits(fg, theta, kk)
+                        for t, Q in hits:
+                            psi = psi_for(Q, kk, self.wheel, self.O,
+                                          ref_psi)
+                            if ahead:
+                                if not (ref_psi + EPS_ANG < psi
+                                        <= ref_psi + window):
+                                    continue
+                            else:
+                                if not (ref_psi - window <= psi
+                                        <= ref_psi + window):
+                                    continue
+                            cands.append(dict(pallet=pg.idx, face=fg.kind,
+                                              t=t, Q=Q, k=kk, psi=psi))
         cands.sort(key=lambda c: c["psi"])
         return cands
 
@@ -138,8 +173,7 @@ class Simulation:
         """同瓦面同齿的连续接触（允许锁面上小幅度回退）。"""
         fg = self.pallets[prev.pallet].lock if prev.face == "lock" \
             else self.pallets[prev.pallet].impulse
-        hits = arc_intersection_t(fg, theta, self.A, self.O,
-                                  self.wheel.Rp)
+        hits = self._tooth_hits(fg, theta, prev.k)
         best = None
         for t, Q in hits:
             psi = psi_for(Q, prev.k, self.wheel, self.O, prev.psi)
@@ -154,33 +188,55 @@ class Simulation:
     def _other_pallet_hits(self, theta: float, psi: float, pallet: int):
         """另一瓦在同一 ψ（±线公差）上是否也有齿接触。"""
         hits = []
+        Rp0 = self.wheel.Rp
         for pg in self.pallets:
             if pg.idx == pallet:
                 continue
             for fg in pg.faces():
-                for t, Q in arc_intersection_t(
-                        fg, theta, self.A, self.O, self.wheel.Rp):
-                    alpha = math.atan2(Q[1] - self.O[1], Q[0] - self.O[0])
+                for t0, Q0 in arc_intersection_t(
+                        fg, theta, self.A, self.O, Rp0):
+                    alpha = math.atan2(Q0[1] - self.O[1], Q0[0] - self.O[0])
                     k = int(round((alpha - self.wheel.s * psi)
                                   / self.wheel.pitch))
                     for kk in (k - 1, k, k + 1):
-                        qpsi = psi_for(Q, kk, self.wheel, self.O, psi)
-                        if abs(qpsi - psi) * self.wheel.Rp < EPS_MM * 3:
-                            hits.append((pg.idx, fg.kind, Q))
+                        if abs(self.wheel.Rp_of(kk) - Rp0) <= 1e-9:
+                            cand = ((t0, Q0),)
+                        else:
+                            cand = self._tooth_hits(fg, theta, kk)
+                        for t, Q in cand:
+                            qpsi = psi_for(Q, kk, self.wheel, self.O, psi)
+                            if abs(qpsi - psi) * Rp0 < EPS_MM * 3:
+                                hits.append((pg.idx, fg.kind, Q))
         return hits
 
+    def _penetration_zones(self, theta: float, psi: float) -> List[int]:
+        """需要检查穿透的齿号中心（默认只查指向 +x 的齿附近）。"""
+        return [int(round((-self.wheel.s * psi) / self.wheel.pitch))]
+
     def _penetration(self, theta: float, psi: float):
-        worst, detail = 0.0, None
-        kc = int(round((-self.wheel.s * psi) / self.wheel.pitch))
-        tris = [(pg.idx, pallet_polygon_world(pg, theta, self.A))
-                for pg in self.pallets]
-        for k in range(kc - 2, kc + 3):
-            poly = self.wheel.tooth_polygon(k, psi, self.O)
-            for pid, tri in tris:
-                d = poly_overlap_depth(poly, tri)
-                if d > worst:
-                    worst, detail = d, pid
-        return worst, detail
+        """返回 (最大穿透深度 mm, 瓦号, 齿号)。"""
+        worst, detail, worst_k = 0.0, None, None
+        tris = []
+        for pg in self.pallets:
+            poly = pallet_polygon_world(pg, theta, self.A)
+            c = poly.mean(axis=0)
+            r = float(np.linalg.norm(poly - c, axis=1).max())
+            tris.append((pg.idx, poly, c, r))
+        zones = self._penetration_zones(theta, psi)
+        span = self.pen_span
+        for kc in zones:
+            for k in range(kc - span, kc + span + 1):
+                poly = self.wheel.tooth_polygon(k, psi, self.O)
+                ct = poly.mean(axis=0)
+                rt = float(np.linalg.norm(poly - ct, axis=1).max())
+                for pid, tri, c, r in tris:
+                    # 包围圆剔除：两多边形不可能相交时跳过 SAT
+                    if float(np.hypot(*(ct - c))) > rt + r:
+                        continue
+                    d = poly_overlap_depth(poly, tri)
+                    if d > worst:
+                        worst, detail, worst_k = d, pid, k
+        return worst, detail, worst_k
 
     def _min_gap_other(self, theta: float, psi: float, pallet: int):
         """锁住时对面瓦到最近齿尖的最小间隙。"""
@@ -206,14 +262,18 @@ class Simulation:
     # ------------------------------------------------------------------
     # 扫描
     # ------------------------------------------------------------------
-    def run(self):
+    def _theta_grid(self) -> np.ndarray:
+        """锚角扫描序列（单个锚周期；全轮分析子类覆盖为多周期）。"""
         up = np.arange(self.th_start, self.th_max + 0.5 * self.step,
                        self.step)
         down = np.arange(self.th_max - self.step,
                          self.th_min - 0.5 * self.step, -self.step)
         back = np.arange(self.th_min + self.step,
                          self.th_start + 0.5 * self.step, self.step)
-        thetas = np.concatenate([up, down, back])
+        return np.concatenate([up, down, back])
+
+    def run(self):
+        thetas = self._theta_grid()
 
         samples: List[Sample] = []
         first = self._face_hits(thetas[0], self.psi_start,
@@ -243,7 +303,8 @@ class Simulation:
                 continue
 
             if cur.pallet is None:
-                cands = self._face_hits(th, cur.psi, pitch, ahead=True)
+                cands = self._face_hits(th, cur.psi, self.relock_window,
+                                        ahead=True)
                 cands = [c for c in cands if c["psi"] > cur.psi + EPS_ANG]
                 if cands:
                     c = cands[0]
@@ -258,30 +319,50 @@ class Simulation:
             nxt = self._continue_contact(th, cur)
             landed = None
             if nxt is None:
-                cands = self._face_hits(th, cur.psi, pitch * 0.999,
+                cands = self._face_hits(th, cur.psi, self.landing_window,
                                         ahead=True)
                 other = [c for c in cands if c["pallet"] != cur.pallet]
                 same = [c for c in cands if c["pallet"] == cur.pallet]
-                if other:
-                    landed = other[0]
-                    drop = landed["psi"] - cur.psi
-                    if drop > pitch * 0.95:
-                        self._anom("order_jump", th, landed["psi"],
-                                   landed["pallet"], landed["face"],
-                                   landed["Q"],
-                                   f"接触跨过近一个齿距（{drop*R2D:.2f}°）",
-                                   drop * R2D)
-                elif same:
-                    # 同一个齿从一面滑到同瓦另一面，或越过一整齿距
-                    c = same[0]
-                    jump = c["psi"] - cur.psi
-                    if jump > pitch * 0.6:
-                        self._anom("order_jump", th, c["psi"], c["pallet"],
-                                   c["face"], c["Q"],
-                                   "接触在同一瓦上跳过一个齿距，落瓦失败",
-                                   jump * R2D)
-                    landed = c
+                # 按接触面状态转移：锁面结束正常进入同瓦冲面（最近者），
+                # 冲面结束才落到对面瓦；否则对面瓦的落点会截胡冲面。
+                if cur.face == "lock":
+                    same_imp = [c for c in same if c["face"] == "impulse"]
+                    if same_imp:
+                        landed = same_imp[0]
+                    elif other:
+                        landed = other[0]
+                        drop = landed["psi"] - cur.psi
+                        if drop > pitch * 0.95:
+                            self._anom("order_jump", th, landed["psi"],
+                                       landed["pallet"], landed["face"],
+                                       landed["Q"],
+                                       f"接触跨过近一个齿距"
+                                       f"（{drop*R2D:.2f}°）",
+                                       drop * R2D)
+                    elif same:
+                        landed = same[0]
                 else:
+                    if other:
+                        landed = other[0]
+                        drop = landed["psi"] - cur.psi
+                        if drop > pitch * 0.95:
+                            self._anom("order_jump", th, landed["psi"],
+                                       landed["pallet"], landed["face"],
+                                       landed["Q"],
+                                       f"接触跨过近一个齿距"
+                                       f"（{drop*R2D:.2f}°）",
+                                       drop * R2D)
+                    elif same:
+                        # 同一个齿从一面滑到同瓦另一面，或越过一整齿距
+                        c = same[0]
+                        jump = c["psi"] - cur.psi
+                        if jump > pitch * 0.6:
+                            self._anom("order_jump", th, c["psi"],
+                                       c["pallet"], c["face"], c["Q"],
+                                       "接触在同一瓦上跳过一个齿距，落瓦失败",
+                                       jump * R2D)
+                        landed = c
+                if landed is None:
                     self._anom("not_locked", th, cur.psi, cur.pallet,
                                cur.face, cur.point,
                                "齿尖脱离瓦面后一个齿距内未被任何瓦接住",
@@ -310,9 +391,17 @@ class Simulation:
                 self._anom("double_contact", th, cur.psi, pid, kind, Q,
                            f"进/出瓦同时接触（{pid} 号瓦 {kind} 面）", None)
 
-            # 穿透
-            pen, pid = self._penetration(th, cur.psi)
+            # 穿透（隔点检查时沿用上次结果；接触切换时立即重查）
+            contact_key = (cur.pallet, cur.face, cur.k)
+            if i % self.pen_check_every == 0 \
+                    or contact_key != self._pen_key:
+                pen, pid, pk = self._penetration(th, cur.psi)
+                self._pen_key = contact_key
+                self._pen_cache = (pen, pid, pk)
+            else:
+                pen, pid, pk = self._pen_cache
             cur.penetration = pen
+            cur.pen_tooth = pk
             if pen > EPS_MM:
                 self._anom("tip_penetration", th, cur.psi, pid,
                            cur.face, cur.point,
@@ -413,11 +502,13 @@ class Simulation:
     # ------------------------------------------------------------------
     # 边界求根
     # ------------------------------------------------------------------
-    def _circle_root(self, anchor_vec, lo, hi, sign=None):
+    def _circle_root(self, anchor_vec, lo, hi, sign=None, radius=None):
+        """瓦角/冲尾越过齿尖圆（radius 缺省为名义节圆）的精确锚角。"""
+        R = self.wheel.Rp if radius is None else radius
+
         def f(th):
             Q = self.A + rot(th, anchor_vec)
-            return math.hypot(Q[0] - self.O[0], Q[1] - self.O[1]) \
-                - self.wheel.Rp
+            return math.hypot(Q[0] - self.O[0], Q[1] - self.O[1]) - R
         try:
             if f(lo) * f(hi) > 0:
                 return None
@@ -428,8 +519,7 @@ class Simulation:
     def _psi_on_face(self, theta, pallet, kind, k, ref):
         fg = self.pallets[pallet].lock if kind == "lock" \
             else self.pallets[pallet].impulse
-        hits = arc_intersection_t(fg, theta, self.A, self.O,
-                                  self.wheel.Rp)
+        hits = self._tooth_hits(fg, theta, k)
         best = None
         for t, Q in hits:
             psi = psi_for(Q, k, self.wheel, self.O, ref)
@@ -454,7 +544,7 @@ class Simulation:
         events.append(dict(kind="initial_lock", theta=first.theta,
                            psi=first.psi, pallet=first.pallet,
                            face="lock", point=first.point,
-                           note="初始静止锁住"))
+                           note="初始静止锁住", _k=first.k))
 
         # 每段补前后一个网格做括号
         grid = list(thetas)
@@ -469,11 +559,14 @@ class Simulation:
         for i, r in enumerate(contact):
             if r.face != "lock":
                 continue
-            r_imp = contact[(i + 1) % n]
-            same_next = (r_imp.pallet == r.pallet
+            r_imp = contact[(i + 1) % n] \
+                if (self.cyclic or i + 1 < n) else None
+            same_next = (r_imp is not None and r_imp.pallet == r.pallet
                          and r_imp.face == "impulse")
-            r_prev_imp = contact[(i - 1) % n]
-            same_prev = (r_prev_imp.pallet == r.pallet
+            r_prev_imp = contact[(i - 1) % n] \
+                if (self.cyclic or i - 1 >= 0) else None
+            same_prev = (r_prev_imp is not None
+                         and r_prev_imp.pallet == r.pallet
                          and r_prev_imp.face == "impulse")
 
             # 落瓦：前一冲面段的冲尾释放角
@@ -481,7 +574,8 @@ class Simulation:
             if same_prev:
                 lo, hi = bracket(r_prev_imp)
                 th_rel = self._circle_root(
-                    self.pallets[r_prev_imp.pallet].impulse.b, lo, hi)
+                    self.pallets[r_prev_imp.pallet].impulse.b, lo, hi,
+                    radius=self.wheel.Rp_of(r_prev_imp.samples[-1].k))
                 if th_rel is not None:
                     rel = self._psi_on_face(
                         th_rel, r_prev_imp.pallet, "impulse",
@@ -493,19 +587,22 @@ class Simulation:
                                 kind="release", theta=th_rel,
                                 psi=rel[0], pallet=r_prev_imp.pallet,
                                 face="impulse", point=rel[1],
-                                note="齿尖离开冲尾"))
+                                note="齿尖离开冲尾",
+                                _k=r_prev_imp.samples[-1].k))
                             events.append(dict(
                                 kind="landing", theta=th_rel,
                                 psi=land["psi"], pallet=r.pallet,
                                 face="lock", point=land["Q"],
                                 note=f"落瓦，落角 "
-                                f"{(land['psi']-rel[0])*R2D:.3f}°"))
+                                f"{(land['psi']-rel[0])*R2D:.3f}°",
+                                _k=land["k"]))
                             events.append(dict(
                                 kind="drop", theta=th_rel,
                                 psi=land["psi"], pallet=r.pallet,
                                 face="lock", point=land["Q"],
                                 note=f"落角 "
-                                f"{(land['psi']-rel[0])*R2D:.3f}°"))
+                                f"{(land['psi']-rel[0])*R2D:.3f}°",
+                                _k=land["k"]))
                             th_land, psi_land = th_rel, land["psi"]
 
             # 解锁角：瓦角进入齿尖圆
@@ -513,7 +610,8 @@ class Simulation:
             if same_next:
                 lo, hi = bracket(r)
                 root = self._circle_root(
-                    self.pallets[r.pallet].lock.b, lo, hi)
+                    self.pallets[r.pallet].lock.b, lo, hi,
+                    radius=self.wheel.Rp_of(r.samples[-1].k))
                 if root is not None:
                     hit = self._psi_on_face(
                         root, r.pallet, "lock",
@@ -525,14 +623,16 @@ class Simulation:
                 pallet=r.pallet, face="lock",
                 point=self.A + rot(
                     th_unlock, self.pallets[r.pallet].lock.b),
-                note="齿尖过瓦角，锁面解锁进入冲面"))
+                note="齿尖过瓦角，锁面解锁进入冲面",
+                _k=r.samples[-1].k))
 
             # 释放（本瓦冲面尾）
             th_release = psi_release = None
             if same_next:
                 lo, hi = bracket(r_imp)
                 th_release = self._circle_root(
-                    self.pallets[r.pallet].impulse.b, lo, hi) \
+                    self.pallets[r.pallet].impulse.b, lo, hi,
+                    radius=self.wheel.Rp_of(r_imp.samples[-1].k)) \
                     or r_imp.th1
                 rel = self._psi_on_face(
                     th_release, r.pallet, "impulse",
@@ -566,7 +666,11 @@ class Simulation:
                 advance_deg=0.0,
                 dead_clearance_mm=clearance,
                 lock_arc_eccentricity_mm=ecc,
-                _psi_land=psi_land, _psi_release=psi_release))
+                _k=r.samples[0].k,
+                _th_land=th_land, _th_unlock=th_unlock,
+                _th_release=th_release,
+                _psi_land=psi_land, _psi_unlock=psi_unlock,
+                _psi_release=psi_release))
 
         # 落角 / 净推进：按 ψ 顺序配相邻两次落瓦
         beats.sort(key=lambda b: b["_psi_land"])
@@ -577,7 +681,7 @@ class Simulation:
                                  - b["_psi_release"]) * R2D
                 b["advance_deg"] = (nb["_psi_land"]
                                     - b["_psi_land"]) * R2D
-        if beats and beats[0]["_psi_release"] is not None \
+        if self.cyclic and beats and beats[0]["_psi_release"] is not None \
                 and math.isnan(beats[-1]["drop_deg"]):
             # 最后一拍落到下一周期的第一次落瓦
             first_next = beats[0]["_psi_land"] + self.wheel.pitch * \
@@ -593,8 +697,7 @@ class Simulation:
         """落瓦静止时齿尖越过瓦角沿锁面的深度（mm）。t: 瓦跟0→瓦角1。"""
         fg = self.pallets[run.pallet].lock
         s0 = run.samples[0]
-        hits = arc_intersection_t(fg, th_land, self.A, self.O,
-                                  self.wheel.Rp)
+        hits = self._tooth_hits(fg, th_land, s0.k)
         t = s0.t
         best = None
         for tt, Q in hits:

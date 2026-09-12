@@ -304,3 +304,188 @@ class DiffReport(BaseModel):
     events_only_in_b: List[dict]
     anomaly_codes_a: List[str]
     anomaly_codes_b: List[str]
+
+
+# ----------------------------------------------------------------------
+# 全轮逐齿误差分析
+# ----------------------------------------------------------------------
+class ToothError(BaseModel):
+    """单个齿的制造误差记录（未录齿沿用名义值）。
+
+    * ``pitch_deviation_deg``: 节距偏差（度）= 该齿到下一齿的实际角距
+      减去名义齿距；全轮之和必须为 0（否则整轮无法闭合）；
+    * ``tip_radial_deviation_mm``: 齿尖径向偏差（mm）= 实际齿尖半径
+      减去名义节圆半径；
+    * ``tip_half_angle_deg``: 齿尖半角实测值（度），缺省沿用名义值。
+    """
+
+    tooth: int = Field(..., ge=0, description="齿号 0..N-1")
+    pitch_deviation_deg: float = 0.0
+    tip_radial_deviation_mm: float = 0.0
+    tip_half_angle_deg: Optional[float] = Field(None, ge=0.0, le=45.0)
+
+
+class WheelErrorTable(BaseModel):
+    """按齿号记录的整轮误差表 + 轮心偏心向量。"""
+
+    name: str = "error-table"
+    teeth: List[ToothError] = Field(default_factory=list)
+    eccentricity: Vec2 = Field(
+        default_factory=lambda: Vec2(x=0.0, y=0.0),
+        description="轮心偏心向量（mm，世界系，随轮旋转）")
+    declared_teeth: Optional[int] = Field(
+        None, description="声明的轮齿数；与 EscapementInput 不符时报错")
+    closure_tol_deg: float = Field(
+        0.01, gt=0, le=1.0, description="累计节距闭合公差（度）")
+
+    @model_validator(mode="after")
+    def _check_table(self) -> "WheelErrorTable":
+        seen = set()
+        dups = set()
+        for e in self.teeth:
+            if e.tooth in seen:
+                dups.add(e.tooth)
+            seen.add(e.tooth)
+        if dups:
+            raise ValueError(f"重复齿号: {sorted(dups)}")
+        total = sum(e.pitch_deviation_deg for e in self.teeth)
+        if abs(total) > self.closure_tol_deg:
+            raise ValueError(
+                f"累计节距无法闭合: 节距偏差总和 {total:+.4f}° 超出"
+                f"闭合公差 ±{self.closure_tol_deg}°（未录齿按 0 计）")
+        return self
+
+
+class WheelAnalyzeRequest(BaseModel):
+    input: EscapementInput
+    errors: WheelErrorTable = Field(default_factory=WheelErrorTable)
+
+
+class WheelCompareRequest(BaseModel):
+    input: EscapementInput
+    errors_a: WheelErrorTable
+    errors_b: WheelErrorTable
+
+
+class HarmonicOut(BaseModel):
+    order: int = Field(description="谐波次数（每转周期数）")
+    amplitude: float = Field(description="幅值（与所属指标同单位）")
+    phase_deg: float
+
+
+class MetricSeriesStats(BaseModel):
+    metric: str
+    mean: float
+    min: float
+    max: float
+    p2p: float = Field(description="峰峰值")
+    worst_tooth: int = Field(description="偏离均值最远的齿号")
+    harmonics: List[HarmonicOut] = Field(default_factory=list)
+
+
+class ToothMetrics(BaseModel):
+    """逐齿（每拍）指标：锁住/解锁/冲面/释放/落瓦的相位与诊断。"""
+
+    tooth: int
+    pallet: Optional[int] = None
+    pallet_name: str = ""
+    lock_deg: Optional[float] = None
+    lift_deg: Optional[float] = None
+    drop_deg: Optional[float] = None
+    recoil_deg: Optional[float] = None
+    dead_clearance_mm: Optional[float] = None
+    max_penetration_mm: float = 0.0
+    land_theta_deg: Optional[float] = None
+    unlock_theta_deg: Optional[float] = None
+    release_theta_deg: Optional[float] = None
+    land_psi_deg: Optional[float] = None
+    unlock_psi_deg: Optional[float] = None
+    release_psi_deg: Optional[float] = None
+    flags: List[str] = Field(default_factory=list)
+    delta: dict = Field(
+        default_factory=dict,
+        description="相对名义轮（空误差表同流程基线）的逐指标差分")
+
+
+class ErrorMechanism(BaseModel):
+    """一类误差机理的识别结果。"""
+
+    present: bool
+    confidence: Literal["high", "medium", "low", "none"] = "none"
+    evidence: str = ""
+    teeth: List[int] = Field(default_factory=list)
+    amplitude: Optional[float] = None
+    phase_deg: Optional[float] = None
+
+
+class ClassificationOut(BaseModel):
+    single_tooth_defect: ErrorMechanism
+    wheel_eccentricity: ErrorMechanism
+    cumulative_index_error: ErrorMechanism
+    dominant: Literal[
+        "single_tooth", "eccentricity", "cumulative_index", "none"]
+
+
+class EffectiveTooth(BaseModel):
+    """折算后的实际齿尖几何（含偏心向量折算）。"""
+
+    tooth: int
+    radius_mm: float
+    angle_deg: float
+    pitch_deviation_deg: float
+    radial_deviation_mm: float
+    tip_half_angle_deg: float
+
+
+class WheelAnalysis(BaseModel):
+    teeth: int
+    beats_observed: int
+    per_tooth: List[ToothMetrics]
+    stats: List[MetricSeriesStats] = Field(
+        description="逐指标统计（基于相对名义轮的差分序列）")
+    worst_tooth: int
+    classification: ClassificationOut
+    effective_teeth: List[EffectiveTooth]
+    baseline: str = Field(
+        "none", description="统计基线：nominal-subtracted=已减名义轮")
+
+
+class WheelAnalyzeResponse(BaseModel):
+    input_snapshot: dict
+    error_table_snapshot: dict
+    result: SimResult
+    analysis: WheelAnalysis
+
+
+class MetricDelta(BaseModel):
+    a: Optional[float] = None
+    b: Optional[float] = None
+    delta: Optional[float] = None
+
+
+class ToothDelta(BaseModel):
+    tooth: int
+    metrics: dict = Field(description="指标名 -> {a, b, delta}")
+    changed: bool
+    max_abs_delta: float = 0.0
+
+
+class MetricCompareSummary(BaseModel):
+    metric: str
+    p2p_a: float
+    p2p_b: float
+    worst_tooth_a: int
+    worst_tooth_b: int
+    max_abs_delta: float
+    worst_delta_tooth: int
+
+
+class WheelCompareResponse(BaseModel):
+    input_snapshot: dict
+    analysis_a: WheelAnalysis
+    analysis_b: WheelAnalysis
+    result_a: SimResult
+    result_b: SimResult
+    tooth_deltas: List[ToothDelta]
+    changed_teeth: List[int] = Field(description="任一指标变化超差的齿号")
+    metric_summaries: List[MetricCompareSummary]

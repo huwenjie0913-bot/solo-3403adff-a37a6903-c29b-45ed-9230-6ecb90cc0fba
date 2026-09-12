@@ -72,9 +72,21 @@ class PalletGeom:
     lock: FaceGeom
     impulse: FaceGeom
     triangle: Tuple[np.ndarray, np.ndarray, np.ndarray]
+    _local_poly: Optional[np.ndarray] = None
 
     def faces(self) -> Tuple[FaceGeom, FaceGeom]:
         return self.lock, self.impulse
+
+    def local_polygon(self) -> np.ndarray:
+        """瓦实体多边形（锚系坐标，缓存；锁面为弧时沿弧加密）。"""
+        if self._local_poly is None:
+            if self.lock.is_arc:
+                pts = [v for v in self.lock.sample(12)]
+            else:
+                pts = [self.lock.a, self.lock.b]
+            pts.append(self.impulse.b)
+            self._local_poly = np.array(pts)
+        return self._local_poly
 
 
 @dataclass
@@ -86,22 +98,40 @@ class WheelGeom:
     pitch: float
     s: int
 
+    # -- 逐齿接口：名义轮为常量实现；带误差轮子类按齿号给出实际值 ------
+    def phi(self, k: int) -> float:
+        """齿 k 在 psi=0 时的角位置（弧度，可累计到整圈之外）。"""
+        return k * self.pitch
+
+    def Rp_of(self, k: int) -> float:
+        return self.Rp
+
+    def half_tip_of(self, k: int) -> float:
+        return self.half_tip
+
+    @property
+    def unwrap(self) -> float:
+        """psi 展开周期：名义轮按齿距，逐齿轮必须按整圈 2π。"""
+        return self.pitch
+
     def tip_angle(self, k: int, psi: float) -> float:
-        return self.s * psi + k * self.pitch
+        return self.s * psi + self.phi(k)
 
     def tip(self, k: int, psi: float, O: np.ndarray) -> np.ndarray:
         a = self.tip_angle(k, psi)
-        return O + self.Rp * np.array([math.cos(a), math.sin(a)])
+        return O + self.Rp_of(k) * np.array([math.cos(a), math.sin(a)])
 
     def tooth_polygon(self, k: int, psi: float,
                       O: np.ndarray) -> np.ndarray:
         """齿的近似多边形：根圆两点 + 齿尖构成的三角齿。"""
         a0 = self.tip_angle(k, psi)
-        tip = O + self.Rp * np.array([math.cos(a0), math.sin(a0)])
+        Rp_k = self.Rp_of(k)
+        tip = O + Rp_k * np.array([math.cos(a0), math.sin(a0)])
         # 齿尖两侧斜线与根圆的交点
+        half = self.half_tip_of(k)
         pts = []
         for side in (-1, 1):
-            ang = a0 + side * self.half_tip
+            ang = a0 + side * half
             cdir = np.array([math.cos(ang), math.sin(ang)])
             rel = tip - O
             b2 = float(np.dot(rel, cdir))
@@ -220,6 +250,21 @@ def point_in_poly(q: np.ndarray, poly: np.ndarray, eps: float = 1e-9) -> bool:
     return inside
 
 
+def points_in_poly(qs: np.ndarray, poly: np.ndarray,
+                   eps: float = 1e-9) -> np.ndarray:
+    """批量射线法：qs (m,2) -> (m,) 布尔。与 point_in_poly 结果一致。"""
+    a = poly
+    b = np.roll(poly, -1, axis=0)
+    # (m, n)：q 的纵坐标是否严格位于边两端纵坐标之间
+    cond = (a[:, 1][None, :] > qs[:, 1:2]) != (b[:, 1][None, :] > qs[:, 1:2])
+    dy = b[:, 1] - a[:, 1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xcross = a[:, 0][None, :] + (b[:, 0] - a[:, 0])[None, :] \
+            * (qs[:, 1:2] - a[:, 1][None, :]) / dy[None, :]
+    crossings = cond & (xcross > qs[:, 0:1] + eps)
+    return (np.count_nonzero(crossings, axis=1) % 2) == 1
+
+
 def poly_overlap_depth(polyA: np.ndarray, polyB: np.ndarray) -> float:
     """两凸多边形相交返回近似最大内深（mm），否则 0。"""
     for poly in (polyA, polyB):
@@ -236,11 +281,11 @@ def poly_overlap_depth(polyA: np.ndarray, polyB: np.ndarray) -> float:
             if pa.max() < pb.min() or pb.max() < pa.min():
                 return 0.0
     depth = 0.0
-    for q in polyA:
-        if point_in_poly(q, polyB):
+    for q, inside in zip(polyA, points_in_poly(polyA, polyB)):
+        if inside:
             depth = max(depth, _inward_depth(q, polyB))
-    for q in polyB:
-        if point_in_poly(q, polyA):
+    for q, inside in zip(polyB, points_in_poly(polyB, polyA)):
+        if inside:
             depth = max(depth, _inward_depth(q, polyA))
     return max(depth, 1e-6)
 
@@ -263,11 +308,5 @@ def _inward_depth(q: np.ndarray, poly: np.ndarray) -> float:
 
 def pallet_polygon_world(pg: PalletGeom, theta: float,
                          A: np.ndarray) -> np.ndarray:
-    """瓦实体多边形（三角形；锁面为弧时沿弧加密）。"""
-    verts = []
-    lock_pts = pg.lock.sample(12) if pg.lock.is_arc else np.array(
-        [pg.lock.a, pg.lock.b])
-    for v in lock_pts:
-        verts.append(A + rot(theta, v))
-    verts.append(A + rot(theta, pg.impulse.b))
-    return np.array(verts)
+    """瓦实体多边形（世界系；锚系顶点缓存于 PalletGeom）。"""
+    return np.array([A + rot(theta, v) for v in pg.local_polygon()])

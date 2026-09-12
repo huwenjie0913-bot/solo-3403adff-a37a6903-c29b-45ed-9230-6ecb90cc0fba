@@ -42,12 +42,25 @@ def build_symmetric_design(
     tip_half_angle_deg: float = 9.0,
     rotation: str = "ccw",
     step_deg: float = 0.05,
+    half_pitch_offset: bool = False,
+    forward_exit_impulse: bool = False,
 ):
-    """构造对称死节擒纵输入 dict（与 EscapementInput 兼容）。"""
+    """构造对称死节擒纵输入 dict（与 EscapementInput 兼容）。
+
+    ``half_pitch_offset=True`` 时两瓦锁角张角取 (m+0.5) 个齿距：
+    一瓦锁住时另一瓦瓦角落在两齿之间（静止段有间隙），整轮锁序
+    正常交替、每齿都能啮合；缺省 False 保持整数齿距（临界对齐）。
+
+    ``forward_exit_impulse=True`` 时出瓦冲尾取 180+γ+s*β（沿轮旋转
+    方向前冲）；缺省 False 为镜像取向 180+γ-s*β（与轮转向相反，
+    出瓦冲面会产生回退）——镜像对称在单一轮转向 下两瓦不可能同时
+    前冲，该选项用于获得双瓦均前冲的可用设计。
+    """
     pitch = 360.0 / teeth
     # 两锁角张角 = 整数齿距；对称布置时 180 + 2γ = m*pitch
     m = int(round((180.0 + 2 * corner_half_angle_deg) / pitch))
-    gamma = (m * pitch - 180.0) / 2.0
+    span = m + 0.5 if half_pitch_offset else m
+    gamma = (span * pitch - 180.0) / 2.0
 
     O = np.array([0.0, 0.0])
     A = np.array([0.0, center_distance])
@@ -71,7 +84,9 @@ def build_symmetric_design(
         if side > 0:
             ang = (-gamma + s * wheel_impulse_deg) * D2R
         else:
-            ang = (180.0 + gamma - s * wheel_impulse_deg) * D2R
+            # forward_exit_impulse: 沿轮转向前冲取 +s*β，镜像取 -s*β
+            sign = 1.0 if forward_exit_impulse else -1.0
+            ang = (180.0 + gamma + sign * s * wheel_impulse_deg) * D2R
         return O + Rp * np.array([math.cos(ang), math.sin(ang)])
 
     pallets = []
